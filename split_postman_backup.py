@@ -6,34 +6,52 @@ Divide un backup de Postman (generado desde Settings -> Data -> Export)
 en archivos mas pequenos y organizados: colecciones individuales,
 ambientes (environments) y un indice legible.
 
-Postman puede entregar el backup en dos formas distintas:
+Postman puede entregar el backup en varias formas distintas segun la
+version de la app:
 
-1. "Data Dump" (lo normal al usar Export Data):
+1. "Data Dump" nuevo (apps recientes, Settings > Account > Export Data):
    Un .zip que, al descomprimirlo, trae subcarpetas como:
      collections/<id>.json   (cada una ya es una Collection v2.1 valida)
      environments/<id>.json
      archive.json            (indice con los ids/nombres originales)
 
-2. Un unico archivo JSON enorme (p.ej. 120k lineas) que en realidad es
-   UNA sola Postman Collection v2.1 (tiene las llaves "info" e "item")
-   donde cada carpeta de primer nivel representa, en la practica,
-   una "coleccion" distinta agrupada dentro de una sola mega-coleccion.
+2. "Backup.postman_dump.json" (apps viejas, p.ej. 9.x, Settings > Data >
+   Export): UN SOLO archivo JSON con claves de primer nivel del tipo:
+     { "collections": [...], "environments": [...], "globals": {...},
+       "headerPresets": [...] }
+   donde "collections" es un arreglo y cada elemento ya es una Postman
+   Collection completa (v2.1: tiene "info" + "item").
 
-Este script detecta automaticamente cual de los dos casos aplica y
-genera una salida organizada:
+3. Un unico archivo JSON que es UNA sola Postman Collection v2.1 enorme
+   (tiene las llaves "info" e "item" directamente en la raiz), donde cada
+   carpeta de primer nivel representa, en la practica, una "coleccion"
+   distinta agrupada dentro de una sola mega-coleccion.
+
+Este script detecta automaticamente cual de los casos aplica. Ademas,
+para cada coleccion que encuentra (venga del caso 2 o 3), tambien la
+divide por carpeta de primer nivel, por si esa coleccion en si misma es
+una mega-coleccion. Salida:
 
     output/
-      collections/<nombre-carpeta>.postman_collection.json
+      collections/<nombre-coleccion>.postman_collection.json
+      collections/<nombre-coleccion>/<nombre-carpeta>.postman_collection.json
       environments/<nombre-ambiente>.postman_environment.json
+      globals.postman_globals.json       (si el backup trae globals)
+      header_presets.json                (si el backup trae headerPresets)
       index.md
 
 Uso:
     python3 split_postman_backup.py <ruta_al_backup> [-o output_dir]
+    python3 split_postman_backup.py <ruta_al_backup> --inspect
 
     <ruta_al_backup> puede ser:
-      - un archivo .zip (el dump tal cual lo descarga Postman)
-      - un directorio ya descomprimido del dump
-      - un unico archivo .json (mega-coleccion o archive.json)
+      - un archivo .zip (data dump nuevo)
+      - un directorio ya descomprimido del data dump nuevo
+      - un unico archivo .json (Backup.postman_dump.json o mega-coleccion)
+
+    --inspect imprime solo la forma del JSON (claves de primer nivel,
+    tipos, cantidades y nombres) sin escribir nada a disco. Util para
+    confirmar el formato real antes de decidir como dividirlo.
 """
 
 import argparse
@@ -69,28 +87,27 @@ def is_postman_environment(data) -> bool:
 
 def handle_dump_dir(root: Path, out_dir: Path) -> dict:
     """Procesa un dump de Postman ya descomprimido (carpetas collections/ environments/)."""
-    stats = {"collections": 0, "environments": 0}
+    stats = {}
 
-    for sub in ("collections", "environments"):
-        src_dir = root / sub
-        if not src_dir.is_dir():
-            continue
-        for jf in src_dir.glob("*.json"):
+    coll_dir = root / "collections"
+    if coll_dir.is_dir():
+        for jf in coll_dir.glob("*.json"):
             try:
                 data = json.loads(jf.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 continue
-            name = None
-            if sub == "collections" and is_postman_collection(data):
-                name = data["info"].get("name", jf.stem)
-                dest = out_dir / "collections" / f"{slugify(name)}.postman_collection.json"
-                write_json(dest, data)
-                stats["collections"] += 1
-            elif sub == "environments":
-                name = data.get("name", jf.stem)
-                dest = out_dir / "environments" / f"{slugify(name)}.postman_environment.json"
-                write_json(dest, data)
-                stats["environments"] += 1
+            if is_postman_collection(data):
+                export_collection(data, out_dir, stats)
+
+    env_dir = root / "environments"
+    if env_dir.is_dir():
+        for jf in env_dir.glob("*.json"):
+            try:
+                data = json.loads(jf.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            export_environment(data, out_dir, stats)
+
     return stats
 
 
@@ -110,69 +127,115 @@ def base_collection_shell(original_info: dict, folder_name: str) -> dict:
     }
 
 
-def split_mega_collection(data: dict, out_dir: Path) -> dict:
-    """Divide una unica Postman Collection v2.1 gigante en una coleccion por
-    cada carpeta de primer nivel. Las requests sueltas (sin carpeta) quedan
-    en una coleccion 'misc'."""
-    stats = {"collections": 0, "requests_sueltas": 0}
-    top_items = data.get("item", [])
+def split_collection_by_top_folders(collection: dict, dest_subdir: Path) -> int:
+    """Divide una Postman Collection v2.1 en una coleccion por cada carpeta
+    de primer nivel, escribiendolas dentro de dest_subdir. Las requests
+    sueltas (sin carpeta) van a 'misc-sin-carpeta'. Devuelve cuantos
+    archivos escribio. Si la coleccion no tiene ninguna carpeta (son todo
+    requests sueltas, o esta vacia), no escribe nada."""
+    top_items = collection.get("item", [])
+    collection_level_vars = collection.get("variable")
+    collection_level_auth = collection.get("auth")
 
-    collection_level_vars = data.get("variable")
-    collection_level_auth = data.get("auth")
+    folders = [e for e in top_items if isinstance(e, dict) and isinstance(e.get("item"), list)]
+    if not folders:
+        return 0
 
-    misc_requests = []
+    misc_requests = [e for e in top_items if not (isinstance(e, dict) and isinstance(e.get("item"), list))]
 
-    for entry in top_items:
-        is_folder = isinstance(entry, dict) and "item" in entry and isinstance(entry["item"], list)
-        if is_folder:
-            folder_name = entry.get("name", "sin-nombre")
-            new_collection = base_collection_shell(data.get("info", {}), folder_name)
-            new_collection["item"] = entry["item"]
-            if "auth" in entry:
-                new_collection["auth"] = entry["auth"]
-            elif collection_level_auth:
-                new_collection["auth"] = collection_level_auth
-            if collection_level_vars:
-                new_collection["variable"] = collection_level_vars
+    written = 0
+    for entry in folders:
+        folder_name = entry.get("name", "sin-nombre")
+        new_collection = base_collection_shell(collection.get("info", {}), folder_name)
+        new_collection["item"] = entry["item"]
+        if "auth" in entry:
+            new_collection["auth"] = entry["auth"]
+        elif collection_level_auth:
+            new_collection["auth"] = collection_level_auth
+        if collection_level_vars:
+            new_collection["variable"] = collection_level_vars
 
-            dest = out_dir / "collections" / f"{slugify(folder_name)}.postman_collection.json"
-            write_json(dest, new_collection)
-            stats["collections"] += 1
-        else:
-            misc_requests.append(entry)
-            stats["requests_sueltas"] += 1
+        dest = dest_subdir / f"{slugify(folder_name)}.postman_collection.json"
+        write_json(dest, new_collection)
+        written += 1
 
     if misc_requests:
-        misc_collection = base_collection_shell(data.get("info", {}), "misc-sin-carpeta")
+        misc_collection = base_collection_shell(collection.get("info", {}), "misc-sin-carpeta")
         misc_collection["item"] = misc_requests
         if collection_level_vars:
             misc_collection["variable"] = collection_level_vars
-        dest = out_dir / "collections" / "misc-sin-carpeta.postman_collection.json"
-        write_json(dest, misc_collection)
-        stats["collections"] += 1
+        write_json(dest_subdir / "misc-sin-carpeta.postman_collection.json", misc_collection)
+        written += 1
+
+    return written
+
+
+def export_collection(collection: dict, out_dir: Path, stats: dict) -> None:
+    """Escribe una coleccion completa en collections/, y ademas, si tiene
+    carpetas de primer nivel, la vuelve a dividir dentro de
+    collections/<nombre>/ por si en si misma es una mega-coleccion."""
+    name = collection.get("info", {}).get("name", "sin-nombre")
+    slug = slugify(name)
+
+    write_json(out_dir / "collections" / f"{slug}.postman_collection.json", collection)
+    stats["collections"] = stats.get("collections", 0) + 1
+
+    sub_written = split_collection_by_top_folders(collection, out_dir / "collections" / slug)
+    stats["sub_colecciones"] = stats.get("sub_colecciones", 0) + sub_written
+
+
+def export_environment(env: dict, out_dir: Path, stats: dict) -> None:
+    name = env.get("name", "sin-nombre")
+    write_json(out_dir / "environments" / f"{slugify(name)}.postman_environment.json", env)
+    stats["environments"] = stats.get("environments", 0) + 1
+
+
+def handle_legacy_single_file_dump(data: dict, out_dir: Path) -> dict:
+    """Maneja el formato viejo de Backup.postman_dump.json (apps ~9.x):
+    un unico JSON con arreglos 'collections' / 'environments' y,
+    opcionalmente, 'globals' / 'headerPresets' en el nivel superior."""
+    stats = {}
+
+    for coll in data.get("collections", []) or []:
+        if isinstance(coll, dict):
+            export_collection(coll, out_dir, stats)
+
+    for env in data.get("environments", []) or []:
+        if isinstance(env, dict):
+            export_environment(env, out_dir, stats)
+
+    if data.get("globals"):
+        write_json(out_dir / "globals.postman_globals.json", data["globals"])
+        stats["globals"] = 1
+
+    if data.get("headerPresets"):
+        write_json(out_dir / "header_presets.json", data["headerPresets"])
+        stats["header_presets"] = len(data["headerPresets"])
 
     return stats
-
-
-def handle_archive_json(data: dict, root: Path, out_dir: Path) -> dict:
-    """Si el input es el archive.json de un data dump, usamos los ids listados
-    para localizar los JSON reales en las carpetas hermanas collections/ environments/."""
-    return handle_dump_dir(root, out_dir)
 
 
 def write_index(out_dir: Path, stats: dict) -> None:
     lines = ["# Indice del backup de Postman dividido", ""]
     lines.append(f"- Colecciones generadas: {stats.get('collections', 0)}")
+    if stats.get("sub_colecciones"):
+        lines.append(f"- Sub-colecciones generadas al dividir por carpeta: {stats.get('sub_colecciones', 0)}")
     if "environments" in stats:
         lines.append(f"- Ambientes generados: {stats.get('environments', 0)}")
-    if "requests_sueltas" in stats:
-        lines.append(f"- Requests sueltas (sin carpeta, agrupadas en misc): {stats.get('requests_sueltas', 0)}")
+    if "globals" in stats:
+        lines.append("- Globals exportados: si")
+    if "header_presets" in stats:
+        lines.append(f"- Header presets exportados: {stats.get('header_presets', 0)}")
     lines.append("")
     lines.append("## Colecciones")
     coll_dir = out_dir / "collections"
     if coll_dir.is_dir():
         for f in sorted(coll_dir.glob("*.json")):
             lines.append(f"- `collections/{f.name}`")
+        for sub in sorted(p for p in coll_dir.iterdir() if p.is_dir()):
+            lines.append(f"  - carpeta `collections/{sub.name}/` (dividida por carpetas de primer nivel):")
+            for f in sorted(sub.glob("*.json")):
+                lines.append(f"    - `collections/{sub.name}/{f.name}`")
     env_dir = out_dir / "environments"
     if env_dir.is_dir() and any(env_dir.glob("*.json")):
         lines.append("")
@@ -182,10 +245,48 @@ def write_index(out_dir: Path, stats: dict) -> None:
     (out_dir / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def inspect_json(data) -> None:
+    """Imprime solo la FORMA del JSON (claves, tipos, cantidades, nombres),
+    nunca el contenido completo de las requests. Pensado para correr en la
+    maquina donde esta el backup real y pegar la salida aqui, sin exponer
+    datos sensibles de las requests (urls, headers, bodies, tokens, etc.)."""
+    if not isinstance(data, dict):
+        print(f"El JSON raiz no es un objeto, es: {type(data).__name__}")
+        return
+
+    print("Claves de primer nivel:")
+    for key, value in data.items():
+        if isinstance(value, list):
+            print(f"  - {key}: lista con {len(value)} elemento(s)")
+            if value and isinstance(value[0], dict):
+                sample_keys = list(value[0].keys())
+                print(f"      claves del primer elemento: {sample_keys}")
+                name = value[0].get("name") or value[0].get("info", {}).get("name") if isinstance(value[0].get("info"), dict) else value[0].get("name")
+                if name:
+                    print(f"      nombre del primer elemento: {name!r}")
+        elif isinstance(value, dict):
+            print(f"  - {key}: objeto con claves {list(value.keys())}")
+        else:
+            print(f"  - {key}: {type(value).__name__} = {value!r}"[:120])
+
+    if is_postman_collection(data):
+        print("\n=> Esto es directamente UNA Postman Collection v2.1 (raiz con 'info' + 'item').")
+        top = data.get("item", [])
+        folders = sum(1 for e in top if isinstance(e, dict) and isinstance(e.get("item"), list))
+        print(f"   Tiene {len(top)} elemento(s) de primer nivel, de los cuales {folders} son carpetas.")
+    elif "collections" in data or "environments" in data:
+        print("\n=> Esto parece el formato viejo de Backup.postman_dump.json (collections/environments como arrays).")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Divide un backup de Postman en colecciones/ambientes individuales.")
     parser.add_argument("input_path", help="Ruta al .zip, carpeta descomprimida o .json del backup de Postman")
     parser.add_argument("-o", "--output", default="output", help="Carpeta de salida (default: ./output)")
+    parser.add_argument(
+        "--inspect",
+        action="store_true",
+        help="No escribe nada: solo imprime la forma del JSON (claves, tipos, cantidades) para confirmar el formato.",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input_path).expanduser().resolve()
@@ -194,6 +295,14 @@ def main() -> int:
     if not input_path.exists():
         print(f"No existe la ruta: {input_path}", file=sys.stderr)
         return 1
+
+    if args.inspect:
+        if input_path.suffix.lower() != ".json":
+            print("--inspect solo aplica a un archivo .json (no a .zip ni a una carpeta).", file=sys.stderr)
+            return 1
+        data = json.loads(input_path.read_text(encoding="utf-8"))
+        inspect_json(data)
+        return 0
 
     stats = {}
 
@@ -220,12 +329,17 @@ def main() -> int:
     elif input_path.suffix.lower() == ".json":
         data = json.loads(input_path.read_text(encoding="utf-8"))
         if is_postman_collection(data):
-            stats = split_mega_collection(data, out_dir)
+            stats = {}
+            export_collection(data, out_dir, stats)
         elif isinstance(data, dict) and ("collections" in data or "environments" in data):
-            # Variante de archive.json con listas de metadatos
-            stats = handle_archive_json(data, input_path.parent, out_dir)
+            # Formato viejo: Backup.postman_dump.json con arrays en el nivel superior
+            stats = handle_legacy_single_file_dump(data, out_dir)
         else:
-            print("El JSON no parece ser ni una Postman Collection v2.1 ni un archive.json reconocible.", file=sys.stderr)
+            print(
+                "El JSON no parece ser ni una Postman Collection v2.1 ni un Backup.postman_dump.json reconocible. "
+                "Corre con --inspect para ver su forma real.",
+                file=sys.stderr,
+            )
             return 1
     else:
         print("Formato de entrada no soportado. Usa un .zip, una carpeta o un .json.", file=sys.stderr)
