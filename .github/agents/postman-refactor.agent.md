@@ -16,17 +16,22 @@ Eres un agente especializado en mantener sanas las colecciones de Postman que vi
   {
     "name": "Local",
     "values": [
-      { "key": "base_url", "value": "http://localhost:3000", "type": "default", "enabled": true }
+      { "key": "apim_negocio_url", "value": "http://localhost:3000", "type": "default", "enabled": true },
+      { "key": "apim_core_url", "value": "http://localhost:3001", "type": "default", "enabled": true },
+      { "key": "apim_ux_url", "value": "http://localhost:3002", "type": "default", "enabled": true },
+      { "key": "ocp_apim_subscription_key_core", "value": "", "type": "secret", "enabled": true },
+      { "key": "ocp_apim_subscription_key_negocio", "value": "", "type": "secret", "enabled": true }
     ],
     "_postman_variable_scope": "environment"
   }
   ```
+  (Los nombres de variable de dominio y subscription key están fijos para este proyecto; ver "Dominios APIM" en la Tarea 1 antes de inventar otros.)
 
 # Tarea 1: Detectar y corregir variables hardcodeadas
 
 Hardcodeado = cualquier valor literal dentro de una request que debería depender del ambiente o ser secreto, en vez de estar escrito tal cual en el JSON de la colección. Busca estos patrones en `url.raw`, `url.host`, `header[].value`, `body.raw`, `auth.*`:
 
-1. **Hosts/URLs absolutas**: `http://...` o `https://...` que no empiecen con `{{base_url}}` (o variable equivalente). Ejemplo: `"raw": "https://api-calidad.miempresa.com/users"` → debe quedar `"raw": "{{base_url}}/users"`.
+1. **Hosts/URLs absolutas**: `http://...` o `https://...` que no empiecen con una variable de dominio (ver más abajo "Dominios APIM"). Ejemplo: `"raw": "https://api-calidad.miempresa.com/users"` → debe quedar `"raw": "{{apim_negocio_url}}/users"` (o el dominio que corresponda).
 2. **Credenciales o tokens**: valores de `Authorization`, `api-key`, `x-api-key`, bearer tokens, client secrets, contraseñas en `body` o `auth`. Estos van a variables marcadas como secretas (`"type": "secret"` en el ambiente), nunca a variables de colección (que se versionan en git).
 3. **IDs de ambiente específicos**: UUIDs, tenant IDs, account IDs que difieren entre local/desarrollo/calidad.
 4. **Puertos o nombres de host repetidos** en varias requests de la misma colección (señal de que debería ser una sola variable `base_url` o `host` reusada).
@@ -58,7 +63,21 @@ Estos 5 patrones aparecen de forma recurrente. Trátalos siempre así, no los de
    - Si no hay decodificación y el valor está simplemente escrito fijo en la request, conviértelo en la variable `{{app_code}}` con el valor correspondiente por ambiente.
    - No asumas cuál de los dos casos aplica sin leer el script real; si no es claro, pregunta.
 
-5. **Header `Ocp-Apim-Subscription-Key`**: siempre variable de ambiente marcada como secreta (ej. `{{ocp_apim_subscription_key}}`, `"type": "secret"` en los 3 ambientes), igual que cualquier API key — nunca como valor literal en la colección.
+5. **Header `Ocp-Apim-Subscription-Key`**: hay **2 variantes**, una por dominio protegido (ver abajo): `{{ocp_apim_subscription_key_core}}` y `{{ocp_apim_subscription_key_negocio}}`. Ambas son variables de ambiente marcadas como secretas (`"type": "secret"`) en los 3 ambientes, nunca un valor literal en la colección. `ux` no lleva este header (no tiene subscription key propia) — si encuentras una request contra el dominio `ux` con este header, no le asignes ninguna de las dos variantes sin confirmarlo con el usuario primero, porque podría ser un error en la colección original o un tercer caso no contemplado.
+
+## Dominios APIM (3 dominios, bases URL independientes)
+
+El backend expone 3 dominios APIM distintos, cada uno con su propia URL base, pero solo 2 de ellos están protegidos con `Ocp-Apim-Subscription-Key`:
+
+| Dominio | Variable de ambiente (base URL) | ¿Lleva `Ocp-Apim-Subscription-Key`? | Variable de la key |
+|---|---|---|---|
+| Negocio | `{{apim_negocio_url}}` | Sí | `{{ocp_apim_subscription_key_negocio}}` |
+| Core | `{{apim_core_url}}` | Sí | `{{ocp_apim_subscription_key_core}}` |
+| UX | `{{apim_ux_url}}` | No | — |
+
+Cómo decidir a qué dominio pertenece una request: identifica por el host real (antes de reemplazarlo) o por el nombre/ruta de la colección/carpeta (ej. si el nombre menciona "negocio", "core" o "ux" explícitamente, o si ya existe un header `Ocp-Apim-Subscription-Key` con un valor que puedas correlacionar a otra request del mismo host). Si una request no calza claramente en ninguno de los 3, no la fuerces a uno: pregúntale al usuario a cuál dominio pertenece antes de asignarle variable.
+
+Declara las 3 variables de base URL y las 2 de subscription key en los 3 archivos de ambiente (`local`, `desarrollo`, `calidad`) aunque una colección puntual solo use uno o dos dominios — así quedan disponibles para el resto de colecciones que sí los usan.
 
 # Tarea 2: Dividir colecciones demasiado grandes
 
@@ -83,6 +102,7 @@ Al terminar una pasada, resume en una lista:
 - Variables hardcodeadas encontradas y a qué variable quedaron mapeadas (archivo + request).
 - Variables secretas que quedaron vacías y requieren que el usuario las complete a mano en `local`/`desarrollo`/`calidad`.
 - Qué pasó con cada uno de los 5 patrones conocidos (`request-date`, `request-id`, `callername`, `app-code`, `Ocp-Apim-Subscription-Key`): dónde se encontraron y cómo quedaron, o si hubo que preguntar por una excepción.
+- A qué dominio (`negocio`/`core`/`ux`) quedó asignada cada request y, para `negocio`/`core`, con qué variante de `Ocp-Apim-Subscription-Key`. Lista cualquier request que no pudiste clasificar con confianza.
 - Colecciones que se dividieron, cuántas partes resultaron y su ubicación.
 - Colecciones que siguen siendo grandes pero no se pudieron dividir automáticamente, y por qué.
 
