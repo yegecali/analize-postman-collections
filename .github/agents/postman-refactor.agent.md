@@ -40,6 +40,26 @@ Para cada hallazgo:
 
 No inventes valores de producción ni asumas que `calidad` es igual a producción.
 
+## Patrones específicos ya identificados en este backup
+
+Estos 5 patrones aparecen de forma recurrente. Trátalos siempre así, no los descubras desde cero cada vez:
+
+1. **Header `request-date`**: hoy se genera con un pre-request script por-request (algo como `const formatDate = moment().format("YYYY-MM-DDTHH:mm:ss.SSSZZ"); postman.setEnvironmentVariable("request-date", formatDate)`), duplicado en varias requests. Muévelo al **pre-request script de la colección** (no de cada request individual), para que se genere una sola vez de forma consistente.
+   - **Recomendación por defecto**: aplícalo a toda la colección, no solo a `TOKEN GENERATOR`. Este tipo de header de timestamp casi siempre sirve para firmar/validar cada llamada real a la API (protección contra replay), no únicamente para pedir el token.
+   - **Excepción**: si al revisar encuentras que el script de `request-date` *solo* existe en la colección `TOKEN GENERATOR` y en ninguna otra request de las demás colecciones, no asumas que es un olvido — pregúntale al usuario antes de replicarlo, porque podría ser una exclusión intencional.
+   - `postman.setEnvironmentVariable(...)` es generación dinámica correcta, no un hardcodeo; si el proyecto ya usa la sintaxis moderna `pm.environment.set(...)` en otros scripts, normaliza a esa sintaxis por consistencia, pero no es obligatorio.
+
+2. **Header `request-id`**: reemplázalo por la variable dinámica reservada de Postman **`{{$guid}}`** puesta directamente como valor del header (sin script propio). Si encuentras un script que arma el UUID a mano, bórralo una vez que confirmes que nada más depende de esa variable.
+
+3. **Header tipo `callername`** (revisa variantes de capitalización/guiones: `CallerName`, `caller-name`, etc.): el valor es constante (`"postman"`) y no cambia entre ambientes, así que va como **variable de colección** (`collection.variable`, ej. `{{caller_name}}` = `"postman"`), no como variable de ambiente — evita duplicarla en los 3 archivos de ambiente si nunca difiere entre ellos.
+
+4. **Campo/header `app-code`**: crea una variable de ambiente `{{app_code}}` en los 3 ambientes. Antes de decidir el valor, revisa el script asociado a la request/colección:
+   - Si el valor se obtiene **decodificando el token** (p. ej. un JWT) en un pre-request/test script, deja ese script tal cual (es generación dinámica legítima) y asegúrate de que el resultado se guarde en la variable de ambiente `app_code` en vez de quedar suelto en una variable local del script.
+   - Si no hay decodificación y el valor está simplemente escrito fijo en la request, conviértelo en la variable `{{app_code}}` con el valor correspondiente por ambiente.
+   - No asumas cuál de los dos casos aplica sin leer el script real; si no es claro, pregunta.
+
+5. **Header `Ocp-Apim-Subscription-Key`**: siempre variable de ambiente marcada como secreta (ej. `{{ocp_apim_subscription_key}}`, `"type": "secret"` en los 3 ambientes), igual que cualquier API key — nunca como valor literal en la colección.
+
 # Tarea 2: Dividir colecciones demasiado grandes
 
 Una colección se considera demasiado grande si cumple alguno de estos umbrales:
@@ -62,6 +82,7 @@ Cuando detectes una colección así:
 Al terminar una pasada, resume en una lista:
 - Variables hardcodeadas encontradas y a qué variable quedaron mapeadas (archivo + request).
 - Variables secretas que quedaron vacías y requieren que el usuario las complete a mano en `local`/`desarrollo`/`calidad`.
+- Qué pasó con cada uno de los 5 patrones conocidos (`request-date`, `request-id`, `callername`, `app-code`, `Ocp-Apim-Subscription-Key`): dónde se encontraron y cómo quedaron, o si hubo que preguntar por una excepción.
 - Colecciones que se dividieron, cuántas partes resultaron y su ubicación.
 - Colecciones que siguen siendo grandes pero no se pudieron dividir automáticamente, y por qué.
 
