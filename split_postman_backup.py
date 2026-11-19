@@ -170,11 +170,159 @@ def split_collection_by_top_folders(collection: dict, dest_subdir: Path) -> int:
     return written
 
 
+def collection_name(collection: dict) -> str:
+    info = collection.get("info")
+    if isinstance(info, dict) and info.get("name"):
+        return info["name"]
+    return collection.get("name", "sin-nombre")
+
+
+def is_legacy_flat_collection(data) -> bool:
+    """Formato viejo de Postman (p.ej. apps 9.x): la coleccion trae 'folders'
+    y 'requests' como listas planas con ids, en vez del arbol anidado 'item'
+    de la Collection v2.1."""
+    return (
+        isinstance(data, dict)
+        and "requests" in data
+        and "folders" in data
+        and "item" not in data
+    )
+
+
+def convert_legacy_headers(headers) -> list:
+    """Headers viejos pueden venir como string 'Key: value\\nKey2: value2'
+    o ya como lista de {key, value}. Normaliza a la lista v2.1."""
+    if isinstance(headers, list):
+        out = []
+        for h in headers:
+            if isinstance(h, dict):
+                out.append({
+                    "key": h.get("key", h.get("name", "")),
+                    "value": h.get("value", ""),
+                    "disabled": h.get("disabled", False),
+                })
+        return out
+    if isinstance(headers, str):
+        out = []
+        for line in headers.splitlines():
+            if ":" in line:
+                key, _, value = line.partition(":")
+                out.append({"key": key.strip(), "value": value.strip()})
+        return out
+    return []
+
+
+def convert_legacy_url(url) -> dict:
+    if isinstance(url, dict):
+        raw = url.get("raw", "")
+    else:
+        raw = url or ""
+    return {"raw": raw}
+
+
+def convert_legacy_body(req: dict) -> dict:
+    data_mode = req.get("dataMode")
+    if data_mode == "raw":
+        return {"mode": "raw", "raw": req.get("rawModeData", req.get("data", ""))}
+    if data_mode in ("urlencoded", "params"):
+        rows = req.get("data", [])
+        values = []
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    values.append({
+                        "key": row.get("key", ""),
+                        "value": row.get("value", ""),
+                        "disabled": not row.get("enabled", True),
+                    })
+        mode = "urlencoded" if data_mode == "urlencoded" else "formdata"
+        return {"mode": mode, mode: values}
+    return {}
+
+
+def convert_legacy_request_item(req: dict) -> dict:
+    item = {
+        "name": req.get("name", "sin-nombre"),
+        "request": {
+            "method": req.get("method", "GET"),
+            "header": convert_legacy_headers(req.get("headers")),
+            "url": convert_legacy_url(req.get("url")),
+        },
+    }
+    body = convert_legacy_body(req)
+    if body:
+        item["request"]["body"] = body
+    if req.get("description"):
+        item["request"]["description"] = req["description"]
+    if req.get("auth"):
+        item["request"]["auth"] = req["auth"]
+    return item
+
+
+def convert_legacy_flat_collection(collection: dict) -> dict:
+    """Reconstruye una Collection v2.1 valida (arbol 'item') a partir del
+    formato viejo (folders + requests planos con ids)."""
+    requests_by_id = {r.get("id"): r for r in collection.get("requests", []) if isinstance(r, dict)}
+    folders_by_id = {f.get("id"): f for f in collection.get("folders", []) if isinstance(f, dict)}
+
+    # A que carpeta pertenece cada request: el campo 'folder' en el request
+    # (si existe) manda; si no, usamos el 'order' de cada carpeta.
+    request_folder = {}
+    for fid, folder in folders_by_id.items():
+        for rid in folder.get("order", []) or []:
+            request_folder.setdefault(rid, fid)
+    for rid, req in requests_by_id.items():
+        if req.get("folder"):
+            request_folder[rid] = req["folder"]
+
+    def build_folder_item(fid: str) -> dict:
+        folder = folders_by_id[fid]
+        child_ids = folder.get("order", []) or [
+            rid for rid, parent in request_folder.items() if parent == fid
+        ]
+        children = [convert_legacy_request_item(requests_by_id[rid]) for rid in child_ids if rid in requests_by_id]
+        return {"name": folder.get("name", "sin-nombre"), "item": children}
+
+    root_order = collection.get("order", []) or []
+    folders_order = collection.get("folders_order", []) or list(folders_by_id.keys())
+
+    top_items = []
+    seen_folder_ids = set()
+    for fid in folders_order:
+        if fid in folders_by_id:
+            top_items.append(build_folder_item(fid))
+            seen_folder_ids.add(fid)
+
+    root_request_ids = [rid for rid in root_order if rid in requests_by_id and rid not in request_folder]
+    if not root_request_ids:
+        root_request_ids = [rid for rid in requests_by_id if rid not in request_folder]
+    for rid in root_request_ids:
+        top_items.append(convert_legacy_request_item(requests_by_id[rid]))
+
+    new_collection = {
+        "info": {
+            "name": collection_name(collection),
+            "description": collection.get("description", ""),
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        "item": top_items,
+    }
+    if collection.get("auth"):
+        new_collection["auth"] = collection["auth"]
+    if collection.get("variables"):
+        new_collection["variable"] = collection["variables"]
+    return new_collection
+
+
 def export_collection(collection: dict, out_dir: Path, stats: dict) -> None:
     """Escribe una coleccion completa en collections/, y ademas, si tiene
     carpetas de primer nivel, la vuelve a dividir dentro de
     collections/<nombre>/ por si en si misma es una mega-coleccion."""
-    name = collection.get("info", {}).get("name", "sin-nombre")
+    if is_legacy_flat_collection(collection):
+        collection = convert_legacy_flat_collection(collection)
+        stats["convertidas_formato_viejo"] = stats.get("convertidas_formato_viejo", 0) + 1
+
+    name = collection_name(collection)
     slug = slugify(name)
 
     write_json(out_dir / "collections" / f"{slug}.postman_collection.json", collection)
@@ -216,7 +364,12 @@ def handle_legacy_single_file_dump(data: dict, out_dir: Path) -> dict:
 
 
 def write_index(out_dir: Path, stats: dict) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
     lines = ["# Indice del backup de Postman dividido", ""]
+    if stats.get("convertidas_formato_viejo"):
+        lines.append(
+            f"- Colecciones convertidas desde el formato viejo (folders+requests planos): {stats['convertidas_formato_viejo']}"
+        )
     lines.append(f"- Colecciones generadas: {stats.get('collections', 0)}")
     if stats.get("sub_colecciones"):
         lines.append(f"- Sub-colecciones generadas al dividir por carpeta: {stats.get('sub_colecciones', 0)}")
@@ -276,6 +429,29 @@ def inspect_json(data) -> None:
         print(f"   Tiene {len(top)} elemento(s) de primer nivel, de los cuales {folders} son carpetas.")
     elif "collections" in data or "environments" in data:
         print("\n=> Esto parece el formato viejo de Backup.postman_dump.json (collections/environments como arrays).")
+
+        colls = data.get("collections", [])
+        if colls and isinstance(colls[0], dict):
+            first = colls[0]
+            if is_legacy_flat_collection(first):
+                print("   Cada coleccion usa el formato PLANO viejo (folders + requests con ids), no 'item' anidado.")
+            print(f"\n   Detalle de la primera coleccion ({collection_name(first)!r}):")
+            for sub_key in ("folders", "requests"):
+                sub_list = first.get(sub_key)
+                if isinstance(sub_list, list):
+                    print(f"     - {sub_key}: {len(sub_list)} elemento(s)")
+                    if sub_list and isinstance(sub_list[0], dict):
+                        sample = sub_list[0]
+                        print(f"         claves: {list(sample.keys())}")
+                        for field in ("url", "headers", "data", "dataMode", "rawModeData", "order", "folder"):
+                            if field in sample:
+                                print(f"           {field}: tipo {type(sample[field]).__name__}")
+
+        envs = data.get("environments", [])
+        if envs and isinstance(envs[0], dict):
+            vals = envs[0].get("values")
+            if isinstance(vals, list) and vals and isinstance(vals[0], dict):
+                print(f"\n   Detalle del primer ambiente ({envs[0].get('name')!r}): values[0] claves = {list(vals[0].keys())}")
 
 
 def main() -> int:
