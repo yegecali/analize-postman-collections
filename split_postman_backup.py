@@ -314,6 +314,29 @@ def convert_legacy_flat_collection(collection: dict) -> dict:
     return new_collection
 
 
+def strip_saved_examples(node) -> int:
+    """Elimina recursivamente los ejemplos de respuesta guardados
+    (saved responses / examples) de cada request. Esos ejemplos pueden
+    contener datos reales capturados (numeros de tarjeta, tokens, etc.)
+    que no deben terminar en las colecciones divididas. Devuelve cuantos
+    ejemplos se quitaron."""
+    removed = 0
+    if isinstance(node, dict):
+        if "item" in node and isinstance(node["item"], list):
+            for child in node["item"]:
+                removed += strip_saved_examples(child)
+        for key in ("response", "responses"):
+            value = node.pop(key, None)
+            if isinstance(value, list):
+                removed += len(value)
+            elif value is not None:
+                removed += 1
+    elif isinstance(node, list):
+        for child in node:
+            removed += strip_saved_examples(child)
+    return removed
+
+
 def export_collection(collection: dict, out_dir: Path, stats: dict) -> None:
     """Escribe una coleccion completa en collections/, y ademas, si tiene
     carpetas de primer nivel, la vuelve a dividir dentro de
@@ -321,6 +344,10 @@ def export_collection(collection: dict, out_dir: Path, stats: dict) -> None:
     if is_legacy_flat_collection(collection):
         collection = convert_legacy_flat_collection(collection)
         stats["convertidas_formato_viejo"] = stats.get("convertidas_formato_viejo", 0) + 1
+
+    removed = strip_saved_examples(collection)
+    if removed:
+        stats["ejemplos_eliminados"] = stats.get("ejemplos_eliminados", 0) + removed
 
     name = collection_name(collection)
     slug = slugify(name)
@@ -369,6 +396,10 @@ def write_index(out_dir: Path, stats: dict) -> None:
     if stats.get("convertidas_formato_viejo"):
         lines.append(
             f"- Colecciones convertidas desde el formato viejo (folders+requests planos): {stats['convertidas_formato_viejo']}"
+        )
+    if stats.get("ejemplos_eliminados"):
+        lines.append(
+            f"- Ejemplos de respuesta guardados eliminados (podian contener datos capturados): {stats['ejemplos_eliminados']}"
         )
     lines.append(f"- Colecciones generadas: {stats.get('collections', 0)}")
     if stats.get("sub_colecciones"):
