@@ -35,3 +35,13 @@ Cada colección generada es un JSON válido en formato **Collection v2.1**, impo
 
 - No se incluyen datos reales de ningún backup en este repositorio; es solo la herramienta.
 - Sin dependencias externas, solo la librería estándar de Python 3.
+
+## Agente de refactor para VS Code (GitHub Copilot)
+
+`.github/agents/postman-refactor.agent.md` define un agente ("custom agent") para GitHub Copilot en VS Code que:
+
+- Detecta valores hardcodeados en las colecciones (`output/collections/**/*.postman_collection.json`) —URLs, tokens, IDs de ambiente— y los convierte en variables.
+- Mantiene 3 ambientes: `local`, `desarrollo` y `calidad` (sin producción, por falta de acceso).
+- Divide colecciones demasiado grandes (más de 40 requests, más de 6 carpetas de primer nivel, o >1MB) reutilizando `split_postman_backup.py`.
+
+Para usarlo en VS Code: abre el chat de Copilot, selecciona el agente **Postman Refactor** en el dropdown de agentes (o `Chat: Open Customizations` si no aparece listado), y pídele que revise una colección.
